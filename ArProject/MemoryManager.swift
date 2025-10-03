@@ -16,9 +16,31 @@ import Combine
 class MemoryManager: ObservableObject {
     @Published var memories: [Memory] = []
     @Published var isReady = false
+    @Published var selectedMemory: Memory?
+    @Published var showingMemoryDetail = false
     
     private var memoryEntities: [UUID: Entity] = [:]
+    private let userDefaults = UserDefaults.standard
+    private var currentUserID: UUID?
+    private var animationTimer: Timer?
     
+    init() {
+        startFloatingAnimation()
+    }
+    
+    deinit {
+        animationTimer?.invalidate()
+    }
+    
+    /// Sets current user and loads their memories
+    func setCurrentUser(_ userID: UUID) {
+        Task { @MainActor in
+            print("🔄 Setting current user: \(userID)")
+            currentUserID = userID
+            loadMemoriesForCurrentUser()
+            print("📱 Loaded \(memories.count) memories for user")
+        }
+    }
     
     /// Registers that AR is ready
     func setReady() {
@@ -27,32 +49,90 @@ class MemoryManager: ObservableObject {
     
     /// Adds a new memory anchored at current camera position
     func addMemory(text: String, photo: UIImage? = nil, at position: SIMD3<Float>) {
-        let memory = Memory(text: text, photo: photo, position: position)
-        memories.append(memory)
+        guard let userID = currentUserID else { 
+            print("❌ No current user set - cannot add memory")
+            return 
+        }
         
-        let photoInfo = photo != nil ? "with photo" : "text only"
-        print("💭 Memory added: '\(text)' (\(photoInfo)) at position \(position)")
+        Task { @MainActor in
+            print("💭 Adding memory for user: \(userID)")
+            print("📝 Text: '\(text)'")
+            print("📷 Has photo: \(photo != nil)")
+            print("📍 Position: \(position)")
+            
+            let memory = Memory(text: text, photo: photo, position: position, userID: userID)
+            memories.append(memory)
+            
+            print("📚 Total memories now: \(memories.count)")
+            
+            saveMemoriesToStorage()
+            
+            let photoInfo = photo != nil ? "with photo" : "text only"
+            print("✅ Memory added successfully: '\(text)' (\(photoInfo)) at position \(position)")
+        }
     }
     
-    /// Creates the visual entity for a memory in AR space
+    /// Shows memory details
+    func showMemoryDetail(_ memory: Memory) {
+        Task { @MainActor in
+            selectedMemory = memory
+            showingMemoryDetail = true
+        }
+    }
+    
+    /// Creates enhanced visual entity for a memory in AR space - floating bubble style
     func createMemoryEntity(for memory: Memory) -> Entity {
-        // Create sphere representing the memory
+        let container = Entity()
+        
+        // Main sphere (floating bubble) - smaller for better precision
         let sphere = Entity()
-        let mesh = MeshResource.generateSphere(radius: 0.05)
-        let material = SimpleMaterial(color: .systemBlue, roughness: 0.2, isMetallic: false)
+        let mesh = MeshResource.generateSphere(radius: 0.06) // Reduced from 0.08
+        
+        // Different colors for photo vs text memories
+        let baseColor: UIColor = memory.photo != nil ? .systemBlue : .systemPurple
+        let material = SimpleMaterial(
+            color: baseColor,
+            roughness: 0.1,
+            isMetallic: false
+        )
+        
         sphere.components.set(ModelComponent(mesh: mesh, materials: [material]))
         
-        // Add custom component for identification
+        // Add subtle glow effect with outer sphere
+        let glowSphere = Entity()
+        let glowMesh = MeshResource.generateSphere(radius: 0.09) // Reduced from 0.12
+        let glowMaterial = SimpleMaterial(
+            color: baseColor.withAlphaComponent(0.3),
+            roughness: 0.0,
+            isMetallic: false
+        )
+        glowSphere.components.set(ModelComponent(mesh: glowMesh, materials: [glowMaterial]))
+        
+        // Add collision component to make the sphere tappable
+        let shape = ShapeResource.generateSphere(radius: 0.09)
+        sphere.components.set(CollisionComponent(shapes: [shape]))
+        
+        // Add components
+        container.addChild(glowSphere)
+        container.addChild(sphere)
+        
+        // IMPORTANT: Add MemoryComponent to both container AND sphere for better hit detection
+        container.components.set(MemoryComponent(memory: memory))
         sphere.components.set(MemoryComponent(memory: memory))
         
-        // Position the memory
-        sphere.position = memory.position
+        // Position the memory - use exact position without floating animation initially
+        container.position = memory.position
+        
+        // Add simple floating animation using periodic transform
+        let floatComponent = PeriodicFloatComponent()
+        sphere.components.set(floatComponent)
         
         // Store reference
-        memoryEntities[memory.id] = sphere
+        memoryEntities[memory.id] = container
         
-        print("🌟 Visual entity created for memory: \(memory.text)")
-        return sphere
+        print("✨ Enhanced floating bubble created for memory: \(memory.text) at \(memory.position)")
+        print("🔧 Added collision and memory components for tap detection")
+        return container
     }
     
     /// Creates a simple 3D text entity to display memory content
@@ -82,17 +162,20 @@ class MemoryManager: ObservableObject {
     
     /// Clears all memories
     func clearAllMemories() {
-        memories.removeAll()
-        
-        for (_, entity) in memoryEntities {
-            entity.removeFromParent()
+        Task { @MainActor in
+            memories.removeAll()
+            saveMemoriesToStorage()
+            
+            for (_, entity) in memoryEntities {
+                entity.removeFromParent()
+            }
+            memoryEntities.removeAll()
+            
+            print("🧹 All memories have been cleared")
         }
-        memoryEntities.removeAll()
-        
-        print("🧹 All memories have been cleared")
     }
     
-    /// Retorna uma memória próxima à posição especificada (raio de 50cm)
+    /// Finds nearby memory for tap detection
     func findNearbyMemory(at position: SIMD3<Float>, radius: Float = 0.5) -> Memory? {
         return memories.first { memory in
             let distance = simd_distance(memory.position, position)
@@ -100,10 +183,94 @@ class MemoryManager: ObservableObject {
         }
     }
     
-    /// Retorna todas as entidades de memória para serem adicionadas à cena
+    /// Returns all memory entities for AR scene
     func getAllMemoryEntities() -> [Entity] {
         return Array(memoryEntities.values)
     }
+    
+    // MARK: - Persistence
+    
+    /// Saves memories to UserDefaults for current user
+    private func saveMemoriesToStorage() {
+        guard let userID = currentUserID else { 
+            print("❌ Cannot save memories - no current user ID")
+            return 
+        }
+        
+        let key = "ARverse_Memories_\(userID.uuidString)"
+        print("💾 Saving \(memories.count) memories with key: \(key)")
+        
+        if let data = try? JSONEncoder().encode(memories) {
+            userDefaults.set(data, forKey: key)
+            userDefaults.synchronize() // Force synchronization
+            print("✅ Successfully saved \(memories.count) memories for user")
+            
+            // Verify the save by trying to load it back
+            if let savedData = userDefaults.data(forKey: key),
+               let verifyMemories = try? JSONDecoder().decode([Memory].self, from: savedData) {
+                print("✅ Verification: \(verifyMemories.count) memories saved and verified")
+            } else {
+                print("❌ Verification failed - could not read back saved data")
+            }
+        } else {
+            print("❌ Failed to encode memories for saving")
+        }
+    }
+    
+    /// Loads memories from storage for current user
+    private func loadMemoriesForCurrentUser() {
+        guard let userID = currentUserID else { return }
+        
+        let key = "ARverse_Memories_\(userID.uuidString)"
+        
+        guard let data = userDefaults.data(forKey: key),
+              let loadedMemories = try? JSONDecoder().decode([Memory].self, from: data) else {
+            memories = []
+            print("📱 No saved memories found for user")
+            return
+        }
+        
+        memories = loadedMemories
+        print("📂 Loaded \(memories.count) memories for user")
+    }
+    
+    /// Clears all stored memories for current user
+    func clearStoredMemories() {
+        guard let userID = currentUserID else { return }
+        
+        let key = "ARverse_Memories_\(userID.uuidString)"
+        userDefaults.removeObject(forKey: key)
+        
+        clearAllMemories()
+        print("🗑️ Cleared all stored memories for user")
+    }
+    
+    // MARK: - Animation System
+    
+    /// Starts the floating animation timer
+    private func startFloatingAnimation() {
+        animationTimer = Timer.scheduledTimer(withTimeInterval: 0.016, repeats: true) { [weak self] _ in
+            self?.updateFloatingAnimation()
+        }
+    }
+    
+    /// Updates floating animation for all memory entities
+    private func updateFloatingAnimation() {
+        let time = Date().timeIntervalSince1970
+        
+        for (_, entity) in memoryEntities {
+            // Find the sphere child that should float
+            for child in entity.children {
+                if child.components.has(PeriodicFloatComponent.self) {
+                    let offset = Float(sin(time * 2.0)) * 0.02
+                    child.transform.translation.y = offset
+                }
+            }
+        }
+    }
 }
 
-// Não precisamos mais da extensão float4x4 para esta versão simplificada
+/// Simple component for floating animation
+struct PeriodicFloatComponent: Component {
+    // Marker component for floating entities
+}
