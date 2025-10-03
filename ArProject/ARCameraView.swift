@@ -12,6 +12,7 @@ import RealityKit
 /// View that integrates ARKit with real camera
 struct ARCameraView: UIViewRepresentable {
     @ObservedObject var memoryManager: MemoryManager
+    @ObservedObject var errorManager: ErrorManager
     @Binding var currentCameraTransform: simd_float4x4?
     
     func makeUIView(context: Context) -> ARView {
@@ -34,10 +35,19 @@ struct ARCameraView: UIViewRepresentable {
         arView.automaticallyConfigureSession = false
         arView.environment.lighting.intensityExponent = 1.5
         
+        // Enable user interaction
+        arView.isUserInteractionEnabled = true
+        
+        // Add tap gesture for memory interaction
+        let tapGesture = UITapGestureRecognizer(target: context.coordinator, action: #selector(context.coordinator.handleTap(_:)))
+        tapGesture.numberOfTapsRequired = 1
+        arView.addGestureRecognizer(tapGesture)
+        
         // Store reference
         context.coordinator.arView = arView
         
         print("🚀 ARView with real camera initialized!")
+        print("🔧 Tap gesture configured for memory interaction")
         return arView
     }
     
@@ -47,19 +57,21 @@ struct ARCameraView: UIViewRepresentable {
     }
     
     func makeCoordinator() -> ARCoordinator {
-        ARCoordinator(memoryManager: memoryManager, currentTransform: $currentCameraTransform)
+        ARCoordinator(memoryManager: memoryManager, errorManager: errorManager, currentTransform: $currentCameraTransform)
     }
 }
 
 /// Coordinator to manage ARKit
 class ARCoordinator: NSObject, ARSessionDelegate {
     let memoryManager: MemoryManager
+    let errorManager: ErrorManager
     @Binding var currentCameraTransform: simd_float4x4?
     var arView: ARView?
     private var memoryEntities: [UUID: Entity] = [:]
     
-    init(memoryManager: MemoryManager, currentTransform: Binding<simd_float4x4?>) {
+    init(memoryManager: MemoryManager, errorManager: ErrorManager, currentTransform: Binding<simd_float4x4?>) {
         self.memoryManager = memoryManager
+        self.errorManager = errorManager
         self._currentCameraTransform = currentTransform
     }
     
@@ -69,11 +81,28 @@ class ARCoordinator: NSObject, ARSessionDelegate {
         // Update camera position
         DispatchQueue.main.async {
             self.currentCameraTransform = frame.camera.transform
+            // Monitor tracking state
+            self.errorManager.handleTrackingState(frame.camera.trackingState)
         }
     }
     
     func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
         print("🎯 \(anchors.count) anchors detected")
+    }
+    
+    func session(_ session: ARSession, didFailWithError error: Error) {
+        DispatchQueue.main.async {
+            if let arError = error as? ARError {
+                switch arError.code {
+                case .cameraUnauthorized:
+                    self.errorManager.showError(.cameraPermissionDenied)
+                case .unsupportedConfiguration:
+                    self.errorManager.showError(.arNotSupported)
+                default:
+                    self.errorManager.showError(.trackingLost)
+                }
+            }
+        }
     }
     
     // MARK: - Memory Management
@@ -84,10 +113,19 @@ class ARCoordinator: NSObject, ARSessionDelegate {
         // Add new memories
         for memory in memories {
             if memoryEntities[memory.id] == nil {
-                let entity = createMemoryEntity(for: memory)
-                arView.scene.addAnchor(entity)
-                memoryEntities[memory.id] = entity
-                print("📍 Memory added: \(memory.text)")
+                // Create floating bubble entity from MemoryManager
+                let memoryEntity = memoryManager.createMemoryEntity(for: memory)
+                
+                // Create anchor to position it in world space with better precision
+                let anchor = AnchorEntity(world: memory.position)
+                anchor.addChild(memoryEntity)
+                
+                // Reset the entity position to (0,0,0) since the anchor handles world positioning
+                memoryEntity.position = SIMD3<Float>(0, 0, 0)
+                
+                arView.scene.addAnchor(anchor)
+                memoryEntities[memory.id] = anchor
+                print("✨ Floating memory added: \(memory.text) at world position \(memory.position)")
             }
         }
         
@@ -97,6 +135,7 @@ class ARCoordinator: NSObject, ARSessionDelegate {
             if !currentMemoryIds.contains(id) {
                 entity.removeFromParent()
                 memoryEntities.removeValue(forKey: id)
+                print("🗑️ Memory removed: \(id)")
             }
         }
     }
@@ -196,5 +235,58 @@ class ARCoordinator: NSObject, ARSessionDelegate {
         let cameraForward = -SIMD3<Float>(transform.columns.2.x, transform.columns.2.y, transform.columns.2.z)
         
         return cameraPosition + (cameraForward * 0.5)
+    }
+    
+    // MARK: - Tap Gesture Handling
+    
+    @objc func handleTap(_ gesture: UITapGestureRecognizer) {
+        guard let arView = arView else { return }
+        
+        let location = gesture.location(in: arView)
+        print("👆 Tap detected at location: \(location)")
+        
+        // Perform hit test on AR content
+        let hitResults = arView.hitTest(location)
+        print("🎯 Hit test found \(hitResults.count) results")
+        
+        for (index, result) in hitResults.enumerated() {
+            print("🔍 Hit \(index): entity \(result.entity)")
+            
+            // Check if tapped entity has a MemoryComponent
+            if let memoryComponent = result.entity.components[MemoryComponent.self] {
+                print("✅ Found MemoryComponent on entity!")
+                // Found a memory! Show details
+                DispatchQueue.main.async {
+                    self.memoryManager.showMemoryDetail(memoryComponent.memory)
+                    
+                    // Haptic feedback
+                    let impactFeedback = UIImpactFeedbackGenerator(style: .medium)
+                    impactFeedback.impactOccurred()
+                }
+                return
+            }
+            
+            // Also check parent entities in case the tap hit a child
+            var currentEntity = result.entity.parent
+            var parentLevel = 1
+            while currentEntity != nil {
+                print("🔍 Checking parent level \(parentLevel): \(currentEntity!)")
+                if let memoryComponent = currentEntity?.components[MemoryComponent.self] {
+                    print("✅ Found MemoryComponent on parent entity level \(parentLevel)!")
+                    DispatchQueue.main.async {
+                        self.memoryManager.showMemoryDetail(memoryComponent.memory)
+                        
+                        // Haptic feedback
+                        let impactFeedback = UIImpactFeedbackGenerator(style: .medium)
+                        impactFeedback.impactOccurred()
+                    }
+                    return
+                }
+                currentEntity = currentEntity?.parent
+                parentLevel += 1
+            }
+        }
+        
+        print("❌ No memory entities found in tap results")
     }
 }
