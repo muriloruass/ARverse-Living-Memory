@@ -6,6 +6,7 @@ import UIKit
 struct AddMemoryView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var memoryManager: MemoryManager
+    @ObservedObject var errorManager: ErrorManager
     
     @State private var memoryText: String = ""
     @State private var capturedPhoto: UIImage?
@@ -146,28 +147,38 @@ struct AddMemoryView: View {
         }
         .preferredColorScheme(.dark)
         .sheet(isPresented: $showingCamera) {
-            CameraPickerView(selectedImage: $capturedPhoto)
+            CameraPickerView(selectedImage: $capturedPhoto, errorManager: errorManager)
         }
         .sheet(isPresented: $showingPhotoLibrary) {
-            PhotoLibraryPickerView(selectedImage: $capturedPhoto)
+            PhotoLibraryPickerView(selectedImage: $capturedPhoto, errorManager: errorManager)
         }
+        .errorAlert(errorManager: errorManager)
     }
     
     /// Saves the memory and closes the screen
     private func saveMemory() {
         let text = memoryText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
+        guard !text.isEmpty else { 
+            print("❌ Cannot save empty memory text")
+            return 
+        }
         
         isAdding = true
+        print("💾 Starting memory save process...")
+        print("📝 Text: '\(text)'")
+        print("📷 Has photo: \(capturedPhoto != nil)")
+        print("📍 Position: \(position)")
         
         // Simulate a small delay for visual feedback
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            // Add memory to manager
             memoryManager.addMemory(text: text, photo: capturedPhoto, at: position)
             
             // Haptic feedback
             let impactFeedback = UIImpactFeedbackGenerator(style: .medium)
             impactFeedback.impactOccurred()
             
+            print("✅ Memory save completed successfully")
             isAdding = false
             dismiss()
         }
@@ -178,6 +189,7 @@ struct AddMemoryView: View {
 
 struct CameraPickerView: UIViewControllerRepresentable {
     @Binding var selectedImage: UIImage?
+    @ObservedObject var errorManager: ErrorManager
     @Environment(\.dismiss) private var dismiss
     
     func makeUIViewController(context: Context) -> UIImagePickerController {
@@ -191,19 +203,23 @@ struct CameraPickerView: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: UIImagePickerController, context: Context) {}
     
     func makeCoordinator() -> Coordinator {
-        Coordinator(self)
+        Coordinator(self, errorManager: errorManager)
     }
     
     class Coordinator: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
         let parent: CameraPickerView
+        let errorManager: ErrorManager
         
-        init(_ parent: CameraPickerView) {
+        init(_ parent: CameraPickerView, errorManager: ErrorManager) {
             self.parent = parent
+            self.errorManager = errorManager
         }
         
         func imagePickerController(_ picker: UIImagePickerController, didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey : Any]) {
             if let image = info[.editedImage] as? UIImage ?? info[.originalImage] as? UIImage {
                 parent.selectedImage = image
+            } else {
+                errorManager.showError(.photoCaptureFailed)
             }
             parent.dismiss()
         }
@@ -218,6 +234,7 @@ struct CameraPickerView: UIViewControllerRepresentable {
 
 struct PhotoLibraryPickerView: UIViewControllerRepresentable {
     @Binding var selectedImage: UIImage?
+    @ObservedObject var errorManager: ErrorManager
     @Environment(\.dismiss) private var dismiss
     
     func makeUIViewController(context: Context) -> UIImagePickerController {
@@ -231,19 +248,23 @@ struct PhotoLibraryPickerView: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: UIImagePickerController, context: Context) {}
     
     func makeCoordinator() -> Coordinator {
-        Coordinator(self)
+        Coordinator(self, errorManager: errorManager)
     }
     
     class Coordinator: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
         let parent: PhotoLibraryPickerView
+        let errorManager: ErrorManager
         
-        init(_ parent: PhotoLibraryPickerView) {
+        init(_ parent: PhotoLibraryPickerView, errorManager: ErrorManager) {
             self.parent = parent
+            self.errorManager = errorManager
         }
         
         func imagePickerController(_ picker: UIImagePickerController, didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey : Any]) {
             if let image = info[.editedImage] as? UIImage ?? info[.originalImage] as? UIImage {
                 parent.selectedImage = image
+            } else {
+                errorManager.showError(.photoCaptureFailed)
             }
             parent.dismiss()
         }
@@ -257,6 +278,7 @@ struct PhotoLibraryPickerView: UIViewControllerRepresentable {
 #Preview {
     AddMemoryView(
         memoryManager: MemoryManager(),
+        errorManager: ErrorManager(),
         position: SIMD3<Float>(0, 0, -0.5)
     )
 }

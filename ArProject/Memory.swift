@@ -13,15 +13,17 @@ import UIKit
 /// Data model for a memory anchored in AR space
 struct Memory: Identifiable, Codable {
     let id = UUID()
+    let userID: UUID // Owner of this memory
     let text: String
     let photoData: Data? // Memory photo
     let position: SIMD3<Float>
     let createdAt: Date
     
-    init(text: String, photo: UIImage? = nil, position: SIMD3<Float>) {
+    init(text: String, photo: UIImage? = nil, position: SIMD3<Float>, userID: UUID) {
         self.text = text
         self.photoData = photo?.jpegData(compressionQuality: 0.8)
         self.position = position
+        self.userID = userID
         self.createdAt = Date()
     }
     
